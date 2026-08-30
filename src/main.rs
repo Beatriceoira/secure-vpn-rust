@@ -1,19 +1,20 @@
-use std::net::UdpSocket;
+mod tunnel;
 
-fn main() -> std::io::Result<()>{
-	let socket = UdpSocket::bind("192.168.56.102:51820")?;
-	println!("VPN server listening on 192.168.56.102:51820");
-	
-	let mut buffer = [0u8; 1560];
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Creating TUN interface...");
 
-	loop{
-		let (size, client_addr) = socket.recv_from(&mut buffer)?;
-		
-		println!(
-			"Received {} bytes from {}",
-			size, client_addr
-			);
+    let mut tun = tunnel::create_tun(
+        "tun0",
+        "10.8.0.1",
+        "255.255.255.0",
+    )?;
 
-			socket.send_to(&buffer[..size], client_addr)?;
-		}
-}	
+    println!("TUN interface created.");
+    println!("Waiting for packets...");
+
+    loop {
+        let packet = tunnel::read_packet(&mut tun)?;
+
+        println!("Received {} byte packet", packet.len());
+    }
+}
