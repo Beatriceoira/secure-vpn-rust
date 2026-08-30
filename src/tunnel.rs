@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use tun::{Configuration, Device};
 
 pub fn create_tun(
@@ -14,18 +14,21 @@ pub fn create_tun(
         .netmask(netmask)
         .up();
 
-   
     let device = tun::create(&config)?;
 
     Ok(device)
 }
 
-pub fn read_packet(device: &mut Device) -> io::Result<Vec<u8>> {
-    let mut buffer = vec![0u8; 1500];
+pub fn read_packet(
+    device: &mut Device,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    device.read(buffer)
+}
 
-    let size = device.read(&mut buffer)?;
-
-    buffer.truncate(size);
-
-    Ok(buffer)
+pub fn write_packet(
+    device: &mut Device,
+    packet: &[u8],
+) -> io::Result<()> {
+    device.write_all(packet)
 }
