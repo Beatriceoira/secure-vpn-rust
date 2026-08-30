@@ -2,7 +2,10 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use x25519_dalek::PublicKey;
+
 mod crypto;
+mod handshake;
 mod packet;
 mod tunnel;
 
@@ -47,16 +50,101 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tun = Arc::new(Mutex::new(tun));
 
-    // Client UDP address.
+    // Current VPN client address.
     let client_addr: Arc<Mutex<Option<SocketAddr>>> =
         Arc::new(Mutex::new(None));
 
-    // Counter for packets sent by the server.
+    // Counter for encrypted packets sent by server.
     let mut send_counter: u64 = 0;
 
-    // Highest packet counter received from the client.
+    // Highest packet counter received from client.
     let highest_received_counter =
         Arc::new(Mutex::new(None::<u64>));
+
+    // ==================================================
+    // HANDSHAKE
+    // ==================================================
+
+    println!("Waiting for CLIENT_HELLO...");
+
+    let mut handshake_buffer = [0u8; 1500];
+
+    let (size, client_addr_value) =
+        socket.recv_from(&mut handshake_buffer)?;
+
+    println!(
+        "Received {} byte handshake from {}",
+        size,
+        client_addr_value
+    );
+
+    let Some((message_type, client_public_bytes)) =
+        handshake::parse_handshake(
+            &handshake_buffer[..size]
+        )
+    else {
+        return Err(
+            "Invalid handshake packet".into()
+        );
+    };
+
+    if message_type != packet::CLIENT_HELLO {
+        return Err(
+            "Expected CLIENT_HELLO".into()
+        );
+    }
+
+    println!("CLIENT_HELLO received.");
+
+    // Remember client address.
+    *client_addr
+        .lock()
+        .unwrap() = Some(client_addr_value);
+
+    // Convert raw bytes into X25519 PublicKey.
+    let client_public_key =
+        PublicKey::from(client_public_bytes);
+
+    // Generate server ephemeral key pair.
+    println!("Generating server key pair...");
+
+    let (server_private, server_public) =
+        handshake::generate_keypair();
+
+    // Derive session key.
+    //
+    // IMPORTANT:
+    // derive_session_key consumes server_private.
+    let session_key =
+        handshake::derive_session_key(
+            server_private,
+            &client_public_key,
+        );
+
+    println!(
+        "Session key successfully derived."
+    );
+
+    // Build SERVER_HELLO using raw [u8; 32].
+    let server_public_bytes =
+        server_public.to_bytes();
+
+    let response =
+        packet::build_server_hello(
+            &server_public_bytes
+        );
+
+    socket.send_to(
+        &response,
+        client_addr_value,
+    )?;
+
+    println!(
+        "SERVER_HELLO sent to {}",
+        client_addr_value
+    );
+
+    println!("VPN handshake complete.");
 
     // ==================================================
     // UDP -> DECRYPT -> TUN
@@ -91,8 +179,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // [ counter ][ nonce ][ ciphertext ]
                         //
 
-                        let Some((counter, nonce, ciphertext)) =
-                            packet::parse_packet(&buffer[..size])
+                        let Some((
+                            counter,
+                            nonce,
+                            ciphertext,
+                        )) =
+                            packet::parse_packet(
+                                &buffer[..size]
+                            )
                         else {
                             eprintln!(
                                 "Invalid VPN packet"
@@ -107,7 +201,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .lock()
                                     .unwrap();
 
-                            if let Some(previous) = *highest {
+                            if let Some(previous) =
+                                *highest
+                            {
                                 if counter <= previous {
                                     eprintln!(
                                         "Replay/old packet rejected: counter={}",
@@ -117,12 +213,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
-                            *highest = Some(counter);
+                            *highest =
+                                Some(counter);
                         }
 
-                        // Decrypt and authenticate.
+                        // Decrypt using negotiated session key.
                         match crypto::decrypt(
-                            &VPN_KEY,
+                            &session_key,
                             &nonce,
                             ciphertext,
                         ) {
@@ -200,7 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             size
         );
 
-        // Get the current VPN client.
+        // Get current VPN client.
         let destination =
             *client_addr.lock().unwrap();
 
@@ -211,13 +308,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
 
-        // Generate a unique nonce.
+        // Generate unique nonce.
         let nonce =
             rand::random::<[u8; 12]>();
 
-        // Encrypt the IP packet.
+        // Encrypt IP packet using negotiated
+        // session key.
         match crypto::encrypt(
-            &VPN_KEY,
+            &session_key,
             &nonce,
             &buffer[..size],
         ) {
@@ -227,11 +325,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // [ counter ][ nonce ][ ciphertext ]
                 //
 
-                let packet = packet::build_packet(
-                    send_counter,
-                    &nonce,
-                    &ciphertext,
-                );
+                let packet =
+                    packet::build_packet(
+                        send_counter,
+                        &nonce,
+                        &ciphertext,
+                    );
 
                 match socket.send_to(
                     &packet,
