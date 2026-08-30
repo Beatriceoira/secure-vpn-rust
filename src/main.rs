@@ -1,9 +1,9 @@
-
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 mod crypto;
+mod packet;
 mod tunnel;
 
 const SERVER_TUN_IP: &str = "10.8.0.1";
@@ -17,9 +17,9 @@ const VPN_KEY: [u8; 32] = [42u8; 32];
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting encrypted VPN server...");
 
-    // --------------------------------------------------
+    // ==================================================
     // Create TUN interface
-    // --------------------------------------------------
+    // ==================================================
 
     let tun = tunnel::create_tun(
         "tun0",
@@ -32,9 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SERVER_TUN_IP
     );
 
-    // --------------------------------------------------
+    // ==================================================
     // Create UDP socket
-    // --------------------------------------------------
+    // ==================================================
 
     let socket = Arc::new(
         UdpSocket::bind(SERVER_UDP)?
@@ -47,10 +47,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tun = Arc::new(Mutex::new(tun));
 
-    // Stores the client's UDP address after
-    // receiving the first packet.
+    // Client UDP address.
     let client_addr: Arc<Mutex<Option<SocketAddr>>> =
         Arc::new(Mutex::new(None));
+
+    // Counter for packets sent by the server.
+    let mut send_counter: u64 = 0;
+
+    // Highest packet counter received from the client.
+    let highest_received_counter =
+        Arc::new(Mutex::new(None::<u64>));
 
     // ==================================================
     // UDP -> DECRYPT -> TUN
@@ -60,6 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let socket = Arc::clone(&socket);
         let tun = Arc::clone(&tun);
         let client_addr = Arc::clone(&client_addr);
+        let highest_received_counter =
+            Arc::clone(&highest_received_counter);
 
         thread::spawn(move || {
             let mut buffer = [0u8; 1500];
@@ -73,47 +81,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             addr
                         );
 
-                        // Remember the client address.
-                        *client_addr.lock().unwrap() =
-                            Some(addr);
+                        // Remember the client's UDP address.
+                        *client_addr
+                            .lock()
+                            .unwrap() = Some(addr);
 
-                        // Packet must contain:
+                        // Parse:
                         //
-                        // 12 bytes nonce
-                        // + ciphertext
+                        // [ counter ][ nonce ][ ciphertext ]
                         //
-                        if size < crypto::NONCE_SIZE {
+
+                        let Some((counter, nonce, ciphertext)) =
+                            packet::parse_packet(&buffer[..size])
+                        else {
                             eprintln!(
-                                "Packet too small"
+                                "Invalid VPN packet"
                             );
                             continue;
-                        }
+                        };
 
-                        // Extract nonce.
-                        let nonce_bytes: [u8; 12] =
-                            match buffer[..12].try_into() {
-                                Ok(nonce) => nonce,
-                                Err(_) => {
+                        // Basic replay protection.
+                        {
+                            let mut highest =
+                                highest_received_counter
+                                    .lock()
+                                    .unwrap();
+
+                            if let Some(previous) = *highest {
+                                if counter <= previous {
                                     eprintln!(
-                                        "Invalid nonce"
+                                        "Replay/old packet rejected: counter={}",
+                                        counter
                                     );
                                     continue;
                                 }
-                            };
+                            }
 
-                        // Remaining bytes are ciphertext.
-                        let ciphertext =
-                            &buffer[12..size];
+                            *highest = Some(counter);
+                        }
 
                         // Decrypt and authenticate.
                         match crypto::decrypt(
                             &VPN_KEY,
-                            &nonce_bytes,
+                            &nonce,
                             ciphertext,
                         ) {
                             Ok(plaintext) => {
                                 println!(
-                                    "UDP -> TUN: {} bytes decrypted",
+                                    "UDP -> TUN: counter={}, {} bytes decrypted",
+                                    counter,
                                     plaintext.len()
                                 );
 
@@ -184,8 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             size
         );
 
-        // We need to know where to send the
-        // encrypted packet.
+        // Get the current VPN client.
         let destination =
             *client_addr.lock().unwrap();
 
@@ -196,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
 
-        // Generate a fresh nonce for this packet.
+        // Generate a unique nonce.
         let nonce =
             rand::random::<[u8; 12]>();
 
@@ -207,31 +222,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &buffer[..size],
         ) {
             Ok(ciphertext) => {
-                // Packet format:
+                // Build:
                 //
-                // [ 12-byte nonce ][ ciphertext + auth tag ]
+                // [ counter ][ nonce ][ ciphertext ]
                 //
-                let mut packet =
-                    Vec::with_capacity(
-                        12 + ciphertext.len()
-                    );
 
-                packet.extend_from_slice(
-                    &nonce
+                let packet = packet::build_packet(
+                    send_counter,
+                    &nonce,
+                    &ciphertext,
                 );
 
-                packet.extend_from_slice(
-                    &ciphertext
-                );
-
-                // Send encrypted packet.
                 match socket.send_to(
                     &packet,
                     addr,
                 ) {
                     Ok(sent) => {
                         println!(
-                            "TUN -> UDP: {} bytes encrypted, sent {} bytes",
+                            "TUN -> UDP: counter={}, {} bytes encrypted, sent {} bytes",
+                            send_counter,
                             size,
                             sent
                         );
@@ -244,6 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+
+                send_counter += 1;
             }
 
             Err(e) => {
@@ -255,4 +266,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
-
