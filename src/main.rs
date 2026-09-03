@@ -35,6 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SERVER_TUN_IP
     );
 
+    // Split the TUN device into independent reader/writer
+    // handles so a blocking read cannot prevent writes.
+    let (mut tun_reader, mut tun_writer) = tun.split();
+
     // ==================================================
     // Create UDP socket
     // ==================================================
@@ -47,8 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "UDP server listening on {}",
         SERVER_UDP
     );
-
-    let tun = Arc::new(Mutex::new(tun));
 
     // Current VPN client address.
     let client_addr: Arc<Mutex<Option<SocketAddr>>> =
@@ -112,9 +114,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         handshake::generate_keypair();
 
     // Derive session key.
-    //
-    // IMPORTANT:
-    // derive_session_key consumes server_private.
     let session_key =
         handshake::derive_session_key(
             server_private,
@@ -125,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Session key successfully derived."
     );
 
-    // Build SERVER_HELLO using raw [u8; 32].
+    // Build SERVER_HELLO.
     let server_public_bytes =
         server_public.to_bytes();
 
@@ -152,7 +151,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let socket = Arc::clone(&socket);
-        let tun = Arc::clone(&tun);
         let client_addr = Arc::clone(&client_addr);
         let highest_received_counter =
             Arc::clone(&highest_received_counter);
@@ -230,18 +228,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     plaintext.len()
                                 );
 
-                                let mut tun =
-                                    tun.lock().unwrap();
-
                                 if let Err(e) =
                                     tunnel::write_packet(
-                                        &mut tun,
+                                        &mut tun_writer,
                                         &plaintext,
                                     )
                                 {
                                     eprintln!(
                                         "TUN write error: {}",
                                         e
+                                    );
+                                } else {
+                                    println!(
+                                        "Packet successfully written to TUN."
                                     );
                                 }
                             }
@@ -272,23 +271,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = [0u8; 1500];
 
     loop {
-        let size = {
-            let mut tun =
-                tun.lock().unwrap();
+        let size = match tunnel::read_packet(
+            &mut tun_reader,
+            &mut buffer,
+        ) {
+            Ok(size) => size,
 
-            match tunnel::read_packet(
-                &mut tun,
-                &mut buffer,
-            ) {
-                Ok(size) => size,
-
-                Err(e) => {
-                    eprintln!(
-                        "TUN read error: {}",
-                        e
-                    );
-                    continue;
-                }
+            Err(e) => {
+                eprintln!(
+                    "TUN read error: {}",
+                    e
+                );
+                continue;
             }
         };
 

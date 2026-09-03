@@ -19,16 +19,16 @@ pub fn create_tun(
     Ok(device)
 }
 
-pub fn read_packet(
-    device: &mut Device,
+pub fn read_packet<R: Read>(
+    reader: &mut R,
     buffer: &mut [u8],
 ) -> io::Result<usize> {
-    device.read(buffer)
+    reader.read(buffer)
 }
 
-pub fn write_packet(
-    device: &mut Device,
+pub fn write_packet<W: Write>(
+    writer: &mut W,
     packet: &[u8],
 ) -> io::Result<()> {
-    device.write_all(packet)
+    writer.write_all(packet)
 }
