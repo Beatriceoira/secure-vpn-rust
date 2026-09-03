@@ -17,6 +17,35 @@ const SERVER_UDP: &str = "192.168.56.102:51820";
 // DO NOT use this key in a real VPN.
 const VPN_KEY: [u8; 32] = [42u8; 32];
 
+fn check_replay(
+    highest: &mut Option<u64>,
+    counter: u64,
+) -> bool {
+    if let Some(previous) = *highest {
+        if counter <= previous {
+            return false;
+        }
+    }
+
+    *highest = Some(counter);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_replay;
+
+    #[test]
+    fn replay_protection_rejects_old_and_duplicate_packets() {
+        let mut highest = None;
+
+        assert!(check_replay(&mut highest, 1));
+        assert!(check_replay(&mut highest, 2));
+        assert!(!check_replay(&mut highest, 2));
+        assert!(!check_replay(&mut highest, 1));
+        assert!(check_replay(&mut highest, 3));
+    }
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting encrypted VPN server...");
 
